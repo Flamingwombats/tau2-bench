@@ -203,21 +203,27 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
         self, langchain_messages: list
     ) -> AssistantMessage:
         """Convert LangGraph agent output to tau2 AssistantMessage."""
-        # Get the last message (should be AIMessage from agent)
-        last_msg = langchain_messages[-1] if langchain_messages else None
-
+        # LangGraph returns all messages, we need to find the new ones
+        # Look backwards through messages to find the last AIMessage with tool_calls or content
         content = None
         tool_calls = None
 
-        if last_msg:
-            # Check if it's an AIMessage with content
-            if hasattr(last_msg, "content") and last_msg.content:
-                content = last_msg.content
+        # Find the last AIMessage in the sequence
+        last_ai_msg = None
+        for msg in reversed(langchain_messages):
+            if isinstance(msg, AIMessage):
+                last_ai_msg = msg
+                break
 
-            # Check for tool calls in the last message
-            if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+        if last_ai_msg:
+            # Check if it's an AIMessage with content
+            if hasattr(last_ai_msg, "content") and last_ai_msg.content:
+                content = last_ai_msg.content
+
+            # Check for tool calls in the last AIMessage
+            if hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
                 tool_calls = []
-                for tc in last_msg.tool_calls:
+                for tc in last_ai_msg.tool_calls:
                     # Handle different tool call formats
                     if isinstance(tc, dict):
                         # Extract arguments - could be in 'args' or 'arguments'
