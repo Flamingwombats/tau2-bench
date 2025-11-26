@@ -106,6 +106,13 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
         self.system_prompt_text = SYSTEM_PROMPT.format(
             domain_policy=self.domain_policy, agent_instruction=AGENT_INSTRUCTION
         )
+
+        # Log tool count for debugging
+        logger.debug(
+            f"Creating LangGraph agent with {len(self.langchain_tools)} tools: "
+            f"{[t.name for t in self.langchain_tools[:5]]}"
+        )
+
         self.agent = create_react_agent(
             self.langchain_llm, self.langchain_tools, prompt=self.system_prompt_text
         )
@@ -134,7 +141,11 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
         return ChatOpenAI(model=self.llm, **llm_kwargs)
 
     def _convert_tools_to_langchain(self, tools: List[Tool]) -> List[StructuredTool]:
-        """Convert tau2 Tool objects to LangChain StructuredTool objects."""
+        """Convert tau2 Tool objects to LangChain StructuredTool objects.
+        
+        Note: These tools will be executed by LangGraph internally.
+        We need to extract tool calls from AIMessages before execution.
+        """
         langchain_tools = []
 
         for tool in tools:
@@ -203,27 +214,41 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
         self, langchain_messages: list
     ) -> AssistantMessage:
         """Convert LangGraph agent output to tau2 AssistantMessage."""
-        # LangGraph returns all messages, we need to find the new ones
-        # Look backwards through messages to find the last AIMessage with tool_calls or content
+        # LangGraph returns all messages, we need to find AIMessages with tool_calls or content
+        # Look backwards through messages to find the last AIMessage
+        # Priority: AIMessage with tool_calls > AIMessage with content
         content = None
         tool_calls = None
 
-        # Find the last AIMessage in the sequence
-        last_ai_msg = None
+        # Find the last AIMessage with tool_calls first (highest priority)
+        ai_msg_with_tools = None
+        ai_msg_with_content = None
+
         for msg in reversed(langchain_messages):
             if isinstance(msg, AIMessage):
-                last_ai_msg = msg
-                break
+                # Check for tool calls first
+                if (
+                    hasattr(msg, "tool_calls")
+                    and msg.tool_calls
+                    and not ai_msg_with_tools
+                ):
+                    ai_msg_with_tools = msg
+                # Also track last AIMessage with content
+                if hasattr(msg, "content") and msg.content and not ai_msg_with_content:
+                    ai_msg_with_content = msg
 
-        if last_ai_msg:
+        # Prefer AIMessage with tool_calls over one with just content
+        target_msg = ai_msg_with_tools or ai_msg_with_content
+
+        if target_msg:
             # Check if it's an AIMessage with content
-            if hasattr(last_ai_msg, "content") and last_ai_msg.content:
-                content = last_ai_msg.content
+            if hasattr(target_msg, "content") and target_msg.content:
+                content = target_msg.content
 
-            # Check for tool calls in the last AIMessage
-            if hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
+            # Check for tool calls (prioritize tool calls over content)
+            if hasattr(target_msg, "tool_calls") and target_msg.tool_calls:
                 tool_calls = []
-                for tc in last_ai_msg.tool_calls:
+                for tc in target_msg.tool_calls:
                     # Handle different tool call formats
                     if isinstance(tc, dict):
                         # Extract arguments - could be in 'args' or 'arguments'
@@ -320,6 +345,9 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
                 state.langchain_messages.append(lc_msg)
 
         # Invoke LangGraph agent with current message history
+        # LangGraph's create_react_agent executes tools internally, but it should
+        # return AIMessages with tool_calls BEFORE executing them
+        # We need to extract those tool calls from the message sequence
         try:
             result = self.agent.invoke({"messages": state.langchain_messages})
 
@@ -329,10 +357,78 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
                 "messages", state.langchain_messages
             )
 
-            # Convert the last assistant message to tau2 format
-            assistant_message = self._langchain_to_tau2_assistant_message(
-                updated_langchain_messages
-            )
+            # Find new messages (those not in previous state)
+            previous_msg_count = len(state.langchain_messages)
+            new_messages = updated_langchain_messages[previous_msg_count:]
+
+            # Debug: Log what messages we got back
+            if new_messages:
+                logger.debug(
+                    f"LangGraph returned {len(new_messages)} new messages "
+                    f"(total: {len(updated_langchain_messages)}, previous: {previous_msg_count})"
+                )
+                for i, msg in enumerate(new_messages):
+                    msg_type = type(msg).__name__
+                    has_tool_calls = hasattr(msg, "tool_calls") and bool(
+                        getattr(msg, "tool_calls", None)
+                    )
+                    has_content = hasattr(msg, "content") and bool(
+                        getattr(msg, "content", None)
+                    )
+                    logger.debug(
+                        f"  New message {i}: {msg_type}, "
+                        f"has_content={has_content}, has_tool_calls={has_tool_calls}"
+                    )
+                    if has_tool_calls:
+                        tool_calls_list = getattr(msg, "tool_calls", [])
+                        logger.debug(
+                            f"    Tool calls: {[tc.get('name', 'unknown') if isinstance(tc, dict) else getattr(tc, 'name', 'unknown') for tc in tool_calls_list]}"
+                        )
+            else:
+                logger.warning(
+                    f"No new messages from LangGraph agent! "
+                    f"Previous: {previous_msg_count}, Updated: {len(updated_langchain_messages)}"
+                )
+
+            # IMPORTANT: LangGraph's create_react_agent executes tools internally
+            # The message sequence will be: AIMessage (with tool_calls) -> ToolMessage -> AIMessage (final response)
+            # We need to find the FIRST AIMessage with tool_calls in the new messages
+            # If found, return that (don't let LangGraph execute it)
+            # Otherwise, return the final AIMessage with content
+            
+            # Look for AIMessage with tool_calls in new messages first
+            ai_msg_with_tool_calls = None
+            for msg in new_messages:
+                if isinstance(msg, AIMessage):
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        ai_msg_with_tool_calls = msg
+                        logger.debug(
+                            f"Found AIMessage with {len(msg.tool_calls)} tool calls in new messages"
+                        )
+                        break  # Use the first one we find
+            
+            if ai_msg_with_tool_calls:
+                # Convert this AIMessage to tau2 format and return it
+                # This prevents LangGraph from executing the tools
+                assistant_message = self._langchain_to_tau2_assistant_message(
+                    [ai_msg_with_tool_calls]  # Just this one message
+                )
+            else:
+                # No tool calls found, convert the last assistant message (final response)
+                assistant_message = self._langchain_to_tau2_assistant_message(
+                    updated_langchain_messages
+                )
+
+            # Log what we extracted
+            if assistant_message.is_tool_call():
+                logger.debug(
+                    f"Extracted {len(assistant_message.tool_calls)} tool calls: "
+                    f"{[tc.name for tc in assistant_message.tool_calls]}"
+                )
+            elif assistant_message.has_text_content():
+                logger.debug(
+                    f"Extracted text response (no tool calls): {assistant_message.content[:100]}..."
+                )
 
             # Validate the message format
             from tau2.agent.base import validate_message_format
