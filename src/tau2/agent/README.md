@@ -45,8 +45,19 @@ This will start a server and automatically open your browser to the API document
 - **LLMAgent**: Standard conversational agent with LLM backend
 - **LLMGTAgent**: Ground truth agent with oracle action guidance
 - **LLMSoloAgent**: Solo agent that works without user interaction
+- **LangChainAgent**: Agent using LangGraph's create_react_agent for tool-using conversations
 
 See [AGENT_DOCUMENTATION.md](./AGENT_DOCUMENTATION.md) for detailed explanations of each agent type.
+
+### LangChain Agent
+
+The LangChain agent is a specialized implementation that uses LangGraph for advanced tool-using capabilities. For detailed documentation, see **[LANGCHAIN_AGENT.md](./LANGCHAIN_AGENT.md)**.
+
+Key features:
+- Uses LangGraph's `create_react_agent` for robust tool execution
+- Isolated environment for preventing state mismatches
+- Comprehensive tool call extraction
+- Automatic API key handling with environment variable fallback
 
 ## Documentation
 
