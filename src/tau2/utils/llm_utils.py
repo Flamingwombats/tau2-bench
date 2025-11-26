@@ -504,11 +504,25 @@ def generate(
     if base_url and "nebius" in base_url.lower():
         import os
 
-        if "api_key" not in kwargs:
+        # Ensure api_key is set - prefer kwargs (if non-empty), then environment
+        api_key_from_kwargs = kwargs.get("api_key")
+        if not api_key_from_kwargs or (
+            isinstance(api_key_from_kwargs, str) and not api_key_from_kwargs.strip()
+        ):
+            # api_key is missing or empty in kwargs, try environment
             nebius_api_key = os.getenv("NEBIUS_API_KEY")
             if nebius_api_key:
                 kwargs["api_key"] = nebius_api_key
                 logger.debug("Auto-loaded NEBIUS_API_KEY from environment for LiteLLM")
+            else:
+                logger.warning(
+                    "Nebius API detected but no api_key provided in kwargs or NEBIUS_API_KEY environment variable. "
+                    "LLM call will likely fail."
+                )
+        else:
+            logger.debug(
+                f"Using api_key from kwargs for Nebius API (length: {len(str(api_key_from_kwargs))})"
+            )
 
         # LiteLLM strips provider prefix when using custom base_url, but Nebius API needs full model name
         # Solution: Use OpenAI provider format and pass full model name via extra_body to override
