@@ -165,19 +165,12 @@ class UserSimulator(BaseUser):
         user_response = assistant_message.content
         logger.debug(f"Response: {user_response}")
 
-        user_message = UserMessage(
-            role="user",
-            content=user_response,
-            cost=assistant_message.cost,
-            usage=assistant_message.usage,
-            raw_data=assistant_message.raw_data,
-        )
-
         # flip the requestor of the tool calls
+        user_tool_calls = None
         if assistant_message.tool_calls is not None:
-            user_message.tool_calls = []
+            user_tool_calls = []
             for tool_call in assistant_message.tool_calls:
-                user_message.tool_calls.append(
+                user_tool_calls.append(
                     ToolCall(
                         id=tool_call.id,
                         name=tool_call.name,
@@ -185,6 +178,24 @@ class UserSimulator(BaseUser):
                         requestor="user",
                     )
                 )
+
+        # Ensure we have either content or tool calls
+        # If content is empty/None and no tool calls, set a default content
+        if (not user_response or (isinstance(user_response, str) and not user_response.strip())) and not user_tool_calls:
+            logger.warning(
+                f"UserSimulator received empty response with no tool calls. "
+                f"Setting default content to 'OK'."
+            )
+            user_response = "OK"
+
+        user_message = UserMessage(
+            role="user",
+            content=user_response,
+            tool_calls=user_tool_calls,
+            cost=assistant_message.cost,
+            usage=assistant_message.usage,
+            raw_data=assistant_message.raw_data,
+        )
 
         # Updating state with response
         state.messages.append(user_message)

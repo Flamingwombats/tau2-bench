@@ -1,6 +1,7 @@
 import json
 import multiprocessing
 import random
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -480,11 +481,14 @@ def run_task(
         )
     elif issubclass(AgentConstructor, LangChainAgent):
         # Extract base_url and api_key from llm_args_agent if provided
+        # IMPORTANT: Make a copy before popping to avoid modifying the shared dict
+        # when running in parallel threads
+        llm_args_agent_copy = deepcopy(llm_args_agent) if llm_args_agent else {}
         base_url = None
         api_key = None
-        if llm_args_agent:
-            base_url = llm_args_agent.pop("base_url", None)
-            api_key = llm_args_agent.pop("api_key", None)
+        if llm_args_agent_copy:
+            base_url = llm_args_agent_copy.pop("base_url", None)
+            api_key = llm_args_agent_copy.pop("api_key", None)
         
         # Create a separate environment instance for LangGraph's tool executions
         # This prevents LangGraph's internal tool executions from affecting the main
@@ -528,7 +532,7 @@ def run_task(
             domain_policy=environment.get_policy(),
             llm=llm_agent,
             tool_executor=tool_executor,
-            llm_args=llm_args_agent,
+            llm_args=llm_args_agent_copy,  # Use the copy, not the original
             base_url=base_url,
             api_key=api_key,
         )
