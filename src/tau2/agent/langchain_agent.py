@@ -7,7 +7,7 @@ agent that can interact with domain tools.
 
 import os
 from copy import deepcopy
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from langchain_core.messages import (
     AIMessage,
@@ -63,6 +63,7 @@ class LangChainAgentState(BaseModel):
     system_messages: list[SystemMessage]
     messages: list[APICompatibleMessage]
     langchain_messages: list  # Store LangChain messages for the agent
+    tool_execution_cache: dict = {}  # Cache of tool_call_id -> ToolMessage for evaluation replay
 
 
 class LangChainAgent(LocalAgent[LangChainAgentState]):
@@ -78,6 +79,7 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
         llm_args: Optional[dict] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        tool_executor: Optional[Callable] = None,
     ):
         """
         Initialize the LangChainAgent.
@@ -95,6 +97,9 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
         self.llm_args = deepcopy(llm_args) if llm_args is not None else {}
         self.base_url = base_url
         self.api_key = api_key
+        self.tool_executor = (
+            tool_executor  # Callback to execute tools through orchestrator
+        )
 
         # Convert tau2 tools to LangChain tools
         self.langchain_tools = self._convert_tools_to_langchain(tools)
@@ -124,9 +129,12 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
         # Handle base_url and api_key
         if self.base_url:
             llm_kwargs["base_url"] = self.base_url
-        if self.api_key:
+
+        # Handle api_key: use provided value, or try to load from environment if missing/empty
+        api_key_provided = self.api_key and self.api_key.strip()
+        if api_key_provided:
             llm_kwargs["api_key"] = self.api_key
-        elif "api_key" not in llm_kwargs:
+        elif "api_key" not in llm_kwargs or not llm_kwargs.get("api_key", "").strip():
             # Try to get from environment if using Nebius API
             # Check if base_url points to Nebius or model name contains "nebius"
             is_nebius = (self.base_url and "nebius" in self.base_url.lower()) or (
@@ -137,36 +145,71 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
                 if api_key:
                     llm_kwargs["api_key"] = api_key
                     logger.debug("Loaded NEBIUS_API_KEY from environment")
+                else:
+                    logger.warning(
+                        "Nebius API detected but no api_key provided and NEBIUS_API_KEY not found in environment"
+                    )
+
+        # Ensure api_key is set (required by OpenAI client)
+        if "api_key" not in llm_kwargs or not llm_kwargs.get("api_key", "").strip():
+            raise ValueError(
+                "api_key must be provided either as a parameter, in llm_args, or via NEBIUS_API_KEY environment variable"
+            )
 
         return ChatOpenAI(model=self.llm, **llm_kwargs)
 
     def _convert_tools_to_langchain(self, tools: List[Tool]) -> List[StructuredTool]:
         """Convert tau2 Tool objects to LangChain StructuredTool objects.
-        
-        Note: These tools will be executed by LangGraph internally.
-        We need to extract tool calls from AIMessages before execution.
+
+        IMPORTANT: If tool_executor is provided, tools will be executed through
+        the orchestrator's environment to ensure state consistency. Otherwise,
+        they execute directly (which can cause state mismatches during evaluation).
         """
         langchain_tools = []
 
         for tool in tools:
-            # Create a wrapper function that calls the tau2 tool
-            # Use a closure to capture the tool properly
-            def make_tool_func(tau2_tool: Tool):
+            # Create a wrapper function that executes tools
+            # Use a closure to capture the tool and tool_executor
+            def make_tool_func(tau2_tool: Tool, executor=None):
                 def tool_func(**kwargs):
-                    try:
-                        result = tau2_tool(**kwargs)
-                        # Convert result to string if needed
-                        if isinstance(result, (dict, list)):
+                    # If we have a tool_executor (from orchestrator), use it
+                    # This executes tools through an isolated environment instance
+                    # that doesn't affect the main environment state
+                    if executor is not None:
+                        # Create a ToolCall object for the executor
+                        from tau2.data_model.message import ToolCall
+                        import uuid
+
+                        tool_call = ToolCall(
+                            id=f"langgraph-{uuid.uuid4()}",
+                            name=tau2_tool.name,
+                            arguments=kwargs,
+                        )
+
+                        # Execute through isolated environment (doesn't affect main environment)
+                        tool_message = executor(tool_call)
+
+                        # Return the content (LangGraph expects a string)
+                        if isinstance(tool_message.content, (dict, list)):
                             import json
 
-                            return json.dumps(result, indent=2)
-                        return str(result) if result is not None else ""
-                    except Exception as e:
-                        logger.error(f"Error calling tool {tau2_tool.name}: {e}")
-                        import traceback
+                            return json.dumps(tool_message.content, indent=2)
+                        return str(tool_message.content) if tool_message.content else ""
+                    else:
+                        # Fallback: execute directly (legacy behavior)
+                        try:
+                            result = tau2_tool(**kwargs)
+                            if isinstance(result, (dict, list)):
+                                import json
 
-                        logger.debug(traceback.format_exc())
-                        return f"Error: {str(e)}"
+                                return json.dumps(result, indent=2)
+                            return str(result) if result is not None else ""
+                        except Exception as e:
+                            logger.error(f"Error calling tool {tau2_tool.name}: {e}")
+                            import traceback
+
+                            logger.debug(traceback.format_exc())
+                            return f"Error: {str(e)}"
 
                 # Set function name and docstring for better debugging
                 tool_func.__name__ = tau2_tool.name
@@ -174,7 +217,7 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
                 return tool_func
 
             # Get the function signature from the tool
-            tool_func = make_tool_func(tool)
+            tool_func = make_tool_func(tool, self.tool_executor)
 
             # Create LangChain StructuredTool
             langchain_tool = StructuredTool.from_function(
@@ -241,11 +284,7 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
         target_msg = ai_msg_with_tools or ai_msg_with_content
 
         if target_msg:
-            # Check if it's an AIMessage with content
-            if hasattr(target_msg, "content") and target_msg.content:
-                content = target_msg.content
-
-            # Check for tool calls (prioritize tool calls over content)
+            # Check for tool calls first (prioritize tool calls over content)
             if hasattr(target_msg, "tool_calls") and target_msg.tool_calls:
                 tool_calls = []
                 for tc in target_msg.tool_calls:
@@ -285,6 +324,12 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
                                 arguments=args,
                             )
                         )
+                # If we have tool calls, don't include content (tau2 requirement)
+                content = None
+            else:
+                # No tool calls, check for content
+                if hasattr(target_msg, "content") and target_msg.content:
+                    content = target_msg.content
 
         # If no content and no tool calls, provide a default message
         if not content and not tool_calls:
@@ -322,6 +367,7 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
             system_messages=[SystemMessage(role="system", content=self.system_prompt)],
             messages=message_history,
             langchain_messages=langchain_messages,
+            tool_execution_cache={},  # Initialize empty cache for recording tool executions
         )
 
     def generate_next_message(
@@ -392,29 +438,59 @@ class LangChainAgent(LocalAgent[LangChainAgentState]):
 
             # IMPORTANT: LangGraph's create_react_agent executes tools internally
             # The message sequence will be: AIMessage (with tool_calls) -> ToolMessage -> AIMessage (final response)
-            # We need to find the FIRST AIMessage with tool_calls in the new messages
-            # If found, return that (don't let LangGraph execute it)
-            # Otherwise, return the final AIMessage with content
-            
-            # Look for AIMessage with tool_calls in new messages first
-            ai_msg_with_tool_calls = None
+            # LangGraph may execute multiple tools in sequence during a single invoke() call.
+            # We need to extract ALL tool calls from ALL AIMessages with tool_calls in new messages,
+            # combine them into a single AssistantMessage, and return that to the orchestrator.
+            # Otherwise, return the LAST AIMessage with content from new messages only
+
+            # Collect ALL AIMessages with tool_calls from new messages
+            ai_msgs_with_tool_calls = []
+            ai_msg_with_content = None
+
             for msg in new_messages:
                 if isinstance(msg, AIMessage):
+                    # Collect all AIMessages with tool calls
                     if hasattr(msg, "tool_calls") and msg.tool_calls:
-                        ai_msg_with_tool_calls = msg
+                        ai_msgs_with_tool_calls.append(msg)
                         logger.debug(
-                            f"Found AIMessage with {len(msg.tool_calls)} tool calls in new messages"
+                            f"Found AIMessage with {len(msg.tool_calls)} tool calls: "
+                            f"{[tc.get('name', 'unknown') if isinstance(tc, dict) else getattr(tc, 'name', 'unknown') for tc in msg.tool_calls]}"
                         )
-                        break  # Use the first one we find
-            
-            if ai_msg_with_tool_calls:
-                # Convert this AIMessage to tau2 format and return it
-                # This prevents LangGraph from executing the tools
+                    # Also track the last AIMessage with content (for when there are no tool calls)
+                    if hasattr(msg, "content") and msg.content:
+                        ai_msg_with_content = msg
+
+            if ai_msgs_with_tool_calls:
+                # Extract ALL tool calls from ALL AIMessages with tool_calls
+                # Combine them into a single AssistantMessage
+                all_tool_calls = []
+                for ai_msg in ai_msgs_with_tool_calls:
+                    if hasattr(ai_msg, "tool_calls") and ai_msg.tool_calls:
+                        all_tool_calls.extend(ai_msg.tool_calls)
+
+                logger.debug(
+                    f"Extracting {len(all_tool_calls)} tool calls from {len(ai_msgs_with_tool_calls)} AIMessages"
+                )
+
+                # Create a combined AIMessage with all tool calls
+                # Use the first AIMessage as a base and replace its tool_calls
+                combined_ai_msg = ai_msgs_with_tool_calls[0]
+                combined_ai_msg.tool_calls = all_tool_calls
+
+                # Convert to tau2 format
                 assistant_message = self._langchain_to_tau2_assistant_message(
-                    [ai_msg_with_tool_calls]  # Just this one message
+                    [combined_ai_msg]
+                )
+            elif ai_msg_with_content:
+                # No tool calls found, use the last AIMessage with content from new messages
+                assistant_message = self._langchain_to_tau2_assistant_message(
+                    [ai_msg_with_content]  # Just this one message
                 )
             else:
-                # No tool calls found, convert the last assistant message (final response)
+                # Fallback: no AIMessages in new messages, look at all messages
+                logger.warning(
+                    "No AIMessages found in new messages, falling back to all messages"
+                )
                 assistant_message = self._langchain_to_tau2_assistant_message(
                     updated_langchain_messages
                 )

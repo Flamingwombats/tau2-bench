@@ -485,10 +485,49 @@ def run_task(
         if llm_args_agent:
             base_url = llm_args_agent.pop("base_url", None)
             api_key = llm_args_agent.pop("api_key", None)
+        
+        # Create a separate environment instance for LangGraph's tool executions
+        # This prevents LangGraph's internal tool executions from affecting the main
+        # environment state, which would cause evaluation replay mismatches
+        langgraph_environment = environment_constructor()
+        
+        # Initialize langgraph_environment to match the main environment's initial state
+        if task.initial_state is not None:
+            initialization_data = task.initial_state.initialization_data
+            initialization_actions = task.initial_state.initialization_actions
+            message_history = task.initial_state.message_history or []
+            
+            langgraph_environment.set_state(
+                initialization_data=initialization_data,
+                initialization_actions=initialization_actions,
+                message_history=message_history,
+            )
+        
+        # Track tool calls executed by LangGraph so we can sync state
+        langgraph_tool_calls = []
+        
+        # Create a tool executor that executes tools through the isolated environment
+        # This ensures LangGraph gets correct responses without affecting main environment
+        def tool_executor(tool_call):
+            """Execute a tool call through an isolated environment instance.
+            
+            This prevents LangGraph's internal tool executions from changing the
+            main environment state, which would cause evaluation replay mismatches.
+            The orchestrator will execute tools separately through the main environment.
+            """
+            # Execute through isolated environment
+            tool_message = langgraph_environment.get_response(tool_call)
+            
+            # Track this tool call for potential state syncing (if needed)
+            langgraph_tool_calls.append((tool_call, tool_message))
+            
+            return tool_message
+        
         agent = AgentConstructor(
             tools=environment.get_tools(),
             domain_policy=environment.get_policy(),
             llm=llm_agent,
+            tool_executor=tool_executor,
             llm_args=llm_args_agent,
             base_url=base_url,
             api_key=api_key,
