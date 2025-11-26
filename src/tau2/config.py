@@ -39,7 +39,7 @@ REDIS_CACHE_VERSION = "v1"
 REDIS_CACHE_TTL = 60 * 60 * 24 * 30
 
 # LANGFUSE
-USE_LANGFUSE = False  # If True, make sure all the env variables are set for langfuse.
+USE_LANGFUSE = True  # If True, make sure all the env variables are set for langfuse.
 
 # API
 API_PORT = 8000
