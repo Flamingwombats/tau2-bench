@@ -1,9 +1,11 @@
 import json
 import multiprocessing
 import random
+import concurrent
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from typing import Optional
 
 from loguru import logger
@@ -169,6 +171,7 @@ def run_domain(config: RunConfig) -> Results:
         seed=config.seed,
         log_level=config.log_level,
         enforce_communication_protocol=config.enforce_communication_protocol,
+        fail_fast=config.fail_fast,
     )
     metrics = compute_metrics(simulation_results)
     ConsoleDisplay.display_agent_metrics(metrics)
@@ -195,6 +198,7 @@ def run_tasks(
     seed: Optional[int] = 300,
     log_level: Optional[str] = "INFO",
     enforce_communication_protocol: bool = False,
+    fail_fast: bool = False,
 ) -> Results:
     """
     Runs tasks for a given domain.
@@ -217,6 +221,7 @@ def run_tasks(
         seed (int): The seed to use for the simulation.
         log_level (str): The log level to use.
         enforce_communication_protocol (bool): Whether to enforce communication protocol rules.
+        fail_fast (bool): Whether to kill further task runs after a task failure.
     Returns:
         The simulation results and the annotations (if llm_review is True).
     """
@@ -349,7 +354,10 @@ def run_tasks(
             with open(save_to, "w") as fp:
                 json.dump(ckpt, fp, indent=2)
 
+    cancel_event = Event()
+
     def _run(task: Task, trial: int, seed: int, progress_str: str) -> SimulationRun:
+
         console_text = Text(
             text=f"{progress_str}. Running task {task.id}, trial {trial + 1}",
             style="bold green",
@@ -370,6 +378,7 @@ def run_tasks(
                 evaluation_type=evaluation_type,
                 seed=seed,
                 enforce_communication_protocol=enforce_communication_protocol,
+                cancel_event=cancel_event,
             )
             simulation.trial = trial
             if console_display:
@@ -394,8 +403,17 @@ def run_tasks(
             args.append((task, trial, seeds[trial], progress_str))
 
     with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
-        res = list(executor.map(_run, *zip(*args)))
-        simulation_results.simulations.extend(res)
+        if fail_fast:
+            res = []
+            for result in executor.map(_run, *zip(*args)):
+                res.append(result)
+                if result.termination_reason:
+                    cancel_event.set()
+                    print(result.termination_reason)
+                    break
+            simulation_results.simulations.extend(res)
+        else:
+            res = executor.map(_run, *zip(*args))
     ConsoleDisplay.console.print(
         "\n✨ [bold green]Successfully completed all simulations![/bold green]\n"
         "To review the simulations, run: [bold blue]tau2 view[/bold blue]"
@@ -417,6 +435,7 @@ def run_task(
     evaluation_type: EvaluationType = EvaluationType.ALL,
     seed: Optional[int] = None,
     enforce_communication_protocol: bool = False,
+    cancel_event: Optional[Event] = None,
 ) -> SimulationRun:
     """
     Runs tasks for a given domain.
@@ -436,10 +455,12 @@ def run_task(
          evaluation_type (EvaluationType): The type of evaluation to use.
          seed (int): The seed to use for the simulation.
          enforce_communication_protocol (bool): Whether to enforce communication protocol rules.
+         cancel_event (Event): A event that the run checks to enforce an external cancellation.
      Returns:
          The simulation run.
     """
-
+    if cancel_event.is_set():
+        raise concurrent.futures.CancelledError("Externally cancelled")
     if max_steps <= 0:
         raise ValueError("Max steps must be greater than 0")
     if max_errors <= 0:

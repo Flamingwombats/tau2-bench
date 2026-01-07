@@ -141,6 +141,12 @@ def add_run_args(parser):
         default=False,
         help="Enforce communication protocol rules (e.g., no mixed messages with text and tool calls). Default is False.",
     )
+    parser.add_argument(
+        "--fail-fast",
+        type=bool,
+        default=False,
+        help="After a task excepts for fails, kills stops adding more task runs. Effectively kills the rest of the run except for threads currently still executing",
+    )
 
 
 def main():
@@ -172,6 +178,7 @@ def main():
                 seed=args.seed,
                 log_level=args.log_level,
                 enforce_communication_protocol=args.enforce_communication_protocol,
+                fail_fast=args.fail_fast,
             )
         )
     )

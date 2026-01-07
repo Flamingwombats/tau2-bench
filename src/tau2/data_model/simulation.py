@@ -167,6 +167,13 @@ class RunConfig(BaseModel):
             default=False,
         ),
     ]
+    fail_fast: Annotated[
+        bool,
+        Field(
+            description="After a task excepts for fails, kills stops adding more task runs. Effectively kills the rest of the run except for threads currently still executing",
+            default=False,
+        )
+    ]
 
     def validate(self) -> None:
         """

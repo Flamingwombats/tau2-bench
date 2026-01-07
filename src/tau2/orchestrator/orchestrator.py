@@ -3,6 +3,7 @@ import uuid
 from copy import deepcopy
 from datetime import datetime, timedelta
 from enum import Enum
+import threading
 from typing import Any, Optional
 
 from loguru import logger
@@ -91,6 +92,7 @@ class Orchestrator:
         seed: Optional[int] = None,
         solo_mode: bool = False,
         validate_communication: bool = False,
+        cancel_event: Optional[threading.Event] = None,
     ):
         """
         Initialize the Orchestrator for managing simulation between Agent, User, and Environment.
@@ -109,6 +111,7 @@ class Orchestrator:
                       Defaults to False.
             validate_communication: If True, validates communication protocol rules (e.g., no mixed
                                    messages with both text and tool calls). Defaults to False.
+            cancel_event: A shared Event to use to cancel the run
         """
 
         self.domain = domain
@@ -131,6 +134,7 @@ class Orchestrator:
         self.from_role: Optional[Role] = None
         self.to_role: Optional[Role] = None
         self.message: Optional[Message] = None
+        self.cancel_event: Optional[threading.Event] = cancel_event
 
     def initialize(self):
         """
